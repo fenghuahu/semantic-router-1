@@ -227,14 +227,17 @@ python train.py --data-file data.jsonl --output-dir models/ --algorithm mlp --de
 - **Automatic deduplication**: Extracts unique queries from input (supports existing training data files)
 - **Category preservation**: If input has `category` field, it's preserved in output (no separate step needed)
 - **Flexible input**: Accepts both simple queries and full training data format
+- **Evaluate-only mode**: If input rows already include `response`, benchmark skips inference and only recalculates `performance`
 
 ```
 --queries           Path to JSONL input file (required)
                     Supports: {"query": "...", "category": "...", "ground_truth": "..."}
                     Also supports existing training data with model_name, performance fields
-                    Automatically deduplicates and extracts unique queries
+                    Automatically detects mode:
+                    - With response field: evaluate-only (no model calls)
+                    - Without response field: normal benchmark mode
 
-Model specification (one required):
+Model specification (required in normal benchmark mode only):
 --models            Comma-separated list of model names (all use same endpoint)
 --model-config      Path to YAML config file (supports different endpoints/auth per model)
 
@@ -246,6 +249,7 @@ For --models:
 
 General:
 --output            Output file path (default: benchmark_output.jsonl)
+                    Must be different from --queries (input overwrite is rejected)
 --concurrency       Number of concurrent requests (default: 4)
 --limit             Limit number of queries to process (for testing)
 --no-progress       Disable progress bar
@@ -277,6 +281,11 @@ python benchmark.py \
   --model-config models.yaml \
   --output benchmark_output.jsonl \
   --limit 500  # Test with 500 queries first
+
+# Evaluate-only: input already contains response/model_name, only recompute performance
+python benchmark.py \
+  --queries existing_responses.jsonl \
+  --output rescored_output.jsonl
 
 # Hybrid mode example (rule + judge)
 python benchmark.py \

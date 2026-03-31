@@ -264,6 +264,16 @@ class BenchmarkResult:
         return result
 
 
+@dataclass
+class ExistingResponseRecord:
+    """A single existing response record for evaluate-only mode."""
+
+    model_name: str
+    response: str
+    response_time: float
+    query_record: QueryRecord
+
+
 def format_concise_query(
     query: str, metric: Optional[str] = None, choices: Optional[str] = None
 ) -> str:
@@ -379,6 +389,126 @@ def load_queries(file_path: Path, deduplicate: bool = True) -> List[QueryRecord]
         cat_counts = Counter(categories)
         print(f"Categories: {dict(cat_counts)}")
 
+    return records
+
+
+def detect_evaluate_only_mode(file_path: Path) -> bool:
+    """Detect whether input JSONL contains existing responses for evaluate-only mode.
+
+    Returns True when all query rows contain a non-null response field.
+    Raises ValueError for mixed input (some rows have response, some do not).
+    """
+
+    query_lines: List[int] = []
+    response_lines: List[int] = []
+    missing_response_lines: List[int] = []
+
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            if not data.get("query"):
+                continue
+
+            query_lines.append(line_num)
+            if "response" in data and data.get("response") is not None:
+                response_lines.append(line_num)
+            else:
+                missing_response_lines.append(line_num)
+
+    if not query_lines:
+        return False
+
+    if response_lines and missing_response_lines:
+        preview = ", ".join(str(x) for x in missing_response_lines[:8])
+        if len(missing_response_lines) > 8:
+            preview += ", ..."
+        raise ValueError(
+            "Mixed input detected: some rows contain response and some do not. "
+            f"Missing response at lines: {preview}"
+        )
+
+    return bool(response_lines)
+
+
+def load_response_records(file_path: Path) -> List[ExistingResponseRecord]:
+    """Load existing response rows for evaluate-only mode."""
+
+    records: List[ExistingResponseRecord] = []
+
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError as e:
+                print(f"Warning: Skipping invalid JSON at line {line_num}: {e}")
+                continue
+
+            query_text = data.get("query", "")
+            if not query_text:
+                print(f"Warning: Skipping line {line_num} - no query field")
+                continue
+
+            if "response" not in data or data.get("response") is None:
+                raise ValueError(
+                    f"Evaluate-only input requires response field at line {line_num}"
+                )
+
+            known_fields = {
+                "query",
+                "ground_truth",
+                "task_name",
+                "metric",
+                "embedding_id",
+                "choices",
+                "model_name",
+                "response",
+                "performance",
+                "response_time",
+                "category",
+            }
+
+            query_record = QueryRecord(
+                query=query_text,
+                ground_truth=data.get("ground_truth"),
+                task_name=data.get("task_name"),
+                metric=data.get("metric"),
+                embedding_id=data.get("embedding_id"),
+                choices=data.get("choices"),
+                category=data.get("category"),
+            )
+
+            for key, value in data.items():
+                if key not in known_fields:
+                    query_record.extra_fields[key] = value
+
+            raw_rt = data.get("response_time", 0.0)
+            try:
+                response_time = float(raw_rt)
+            except (TypeError, ValueError):
+                response_time = 0.0
+
+            records.append(
+                ExistingResponseRecord(
+                    model_name=str(data.get("model_name") or "unknown_model"),
+                    response=str(data.get("response") or ""),
+                    response_time=response_time,
+                    query_record=query_record,
+                )
+            )
+
+    print(f"Loaded {len(records)} response records from {file_path}")
     return records
 
 
@@ -1070,6 +1200,76 @@ def _evaluate_with_judge(
     return None, metadata
 
 
+def score_existing_response(
+    query: QueryRecord,
+    response_text: str,
+    eval_config: Optional[EvalConfig] = None,
+    eval_client: Optional[OpenAI] = None,
+    judge_semaphore: Optional[threading.Semaphore] = None,
+) -> Tuple[float, Dict[str, Any]]:
+    """Score an existing response using rule and optional judge logic."""
+
+    extra_fields = dict(query.extra_fields)
+
+    rule_score = evaluate_response(
+        response_text,
+        query.ground_truth,
+        query.metric,
+        query.choices,
+    )
+    performance = rule_score
+
+    # Default metadata values for explainability.
+    extra_fields["evaluation_mode"] = "rule_only"
+    extra_fields["evaluation_method"] = "rule"
+    extra_fields["rule_score"] = rule_score
+    extra_fields["final_score"] = performance
+
+    if eval_config is not None:
+        extra_fields["evaluation_mode"] = eval_config.mode
+        extra_fields["judge_rubric_version"] = eval_config.rubric_version
+
+        judge_score: Optional[float] = None
+        should_judge = query.ground_truth is not None and _should_use_judge(
+            eval_config,
+            query.metric,
+            rule_score,
+        )
+
+        if should_judge:
+            if eval_client is None:
+                eval_client = eval_config.get_client()
+            judge_score, judge_meta = _evaluate_with_judge(
+                eval_client=eval_client,
+                eval_config=eval_config,
+                query=query,
+                response_text=response_text,
+                judge_semaphore=judge_semaphore,
+            )
+            extra_fields.update(judge_meta)
+            if judge_score is None and eval_config.hard_fail:
+                raise RuntimeError(
+                    extra_fields.get("judge_error", "judge evaluation failed")
+                )
+
+        final_score, fusion_strategy = _fuse_scores(
+            eval_config,
+            rule_score,
+            judge_score,
+        )
+        performance = final_score
+        extra_fields["final_score"] = final_score
+        extra_fields["fusion_strategy"] = fusion_strategy
+
+        if judge_score is not None:
+            extra_fields["judge_score"] = judge_score
+            extra_fields["evaluation_method"] = (
+                "judge" if eval_config.mode == "judge_only" else "hybrid"
+            )
+
+    return performance, extra_fields
+
+
 def benchmark_query(
     model_config: ModelConfig,
     query: QueryRecord,
@@ -1115,63 +1315,13 @@ def benchmark_query(
     # Evaluate performance
     extra_fields = dict(query.extra_fields)
     if success:
-        rule_score = evaluate_response(
-            response_text,
-            query.ground_truth,
-            query.metric,
-            query.choices,
+        performance, extra_fields = score_existing_response(
+            query=query,
+            response_text=response_text,
+            eval_config=eval_config,
+            eval_client=eval_client,
+            judge_semaphore=judge_semaphore,
         )
-        performance = rule_score
-
-        # Default metadata values for explainability.
-        extra_fields["evaluation_mode"] = "rule_only"
-        extra_fields["evaluation_method"] = "rule"
-        extra_fields["rule_score"] = rule_score
-        extra_fields["final_score"] = performance
-
-        if eval_config is not None:
-            extra_fields["evaluation_mode"] = eval_config.mode
-            extra_fields["judge_rubric_version"] = eval_config.rubric_version
-
-            judge_score: Optional[float] = None
-            should_judge = query.ground_truth is not None and _should_use_judge(
-                eval_config,
-                query.metric,
-                rule_score,
-            )
-
-            if should_judge:
-                if eval_client is None:
-                    eval_client = eval_config.get_client()
-                judge_score, judge_meta = _evaluate_with_judge(
-                    eval_client=eval_client,
-                    eval_config=eval_config,
-                    query=query,
-                    response_text=response_text,
-                    judge_semaphore=judge_semaphore,
-                )
-                extra_fields.update(judge_meta)
-                if judge_score is None and eval_config.hard_fail:
-                    raise RuntimeError(
-                        extra_fields.get("judge_error", "judge evaluation failed")
-                    )
-
-            final_score, fusion_strategy = _fuse_scores(
-                eval_config,
-                rule_score,
-                judge_score,
-            )
-            performance = final_score
-            extra_fields["final_score"] = final_score
-            extra_fields["fusion_strategy"] = fusion_strategy
-
-            if judge_score is not None:
-                extra_fields["judge_score"] = judge_score
-                extra_fields["evaluation_method"] = (
-                    "judge"
-                    if eval_config.mode == "judge_only"
-                    else "hybrid"
-                )
     else:
         performance = 0.0
         extra_fields["evaluation_mode"] = "rule_only"
@@ -1291,6 +1441,98 @@ def run_benchmark(
     return results
 
 
+def _evaluate_existing_record(
+    record: ExistingResponseRecord,
+    eval_config: Optional[EvalConfig],
+    eval_client: Optional[OpenAI],
+    judge_semaphore: Optional[threading.Semaphore],
+) -> BenchmarkResult:
+    """Evaluate one precomputed response and return benchmark-compatible output."""
+
+    performance, extra_fields = score_existing_response(
+        query=record.query_record,
+        response_text=record.response,
+        eval_config=eval_config,
+        eval_client=eval_client,
+        judge_semaphore=judge_semaphore,
+    )
+
+    return BenchmarkResult(
+        query=record.query_record.query,
+        model_name=record.model_name,
+        response=record.response,
+        performance=performance,
+        response_time=record.response_time,
+        ground_truth=record.query_record.ground_truth,
+        task_name=record.query_record.task_name,
+        metric=record.query_record.metric,
+        embedding_id=record.query_record.embedding_id,
+        choices=record.query_record.choices,
+        category=record.query_record.category,
+        extra_fields=extra_fields,
+    )
+
+
+def run_evaluation_only(
+    records: List[ExistingResponseRecord],
+    concurrency: int = 4,
+    progress: bool = True,
+    on_progress=None,
+    eval_config: Optional[EvalConfig] = None,
+) -> List[BenchmarkResult]:
+    """Evaluate already-generated responses without querying any model endpoint."""
+
+    total_tasks = len(records)
+    print(f"\nEvaluate-only mode: scoring {total_tasks} existing responses")
+    print(f"Concurrency: {concurrency}")
+    print("No model inference requests will be sent in this mode.")
+    print()
+
+    results: List[BenchmarkResult] = []
+    completed = 0
+    failed = 0
+    judge_semaphore: Optional[threading.Semaphore] = None
+    eval_client: Optional[OpenAI] = None
+    if eval_config is not None and eval_config.mode != "rule_only":
+        judge_semaphore = threading.Semaphore(max(1, eval_config.concurrency))
+        eval_client = eval_config.get_client()
+
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = {
+            executor.submit(
+                _evaluate_existing_record,
+                record,
+                eval_config,
+                eval_client,
+                judge_semaphore,
+            ): record
+            for record in records
+        }
+
+        iterator = as_completed(futures)
+        if progress:
+            iterator = tqdm(iterator, total=total_tasks, desc="Evaluating")
+
+        for future in iterator:
+            try:
+                results.append(future.result())
+                completed += 1
+            except Exception as e:
+                failed += 1
+                print(f"\nError evaluating existing response: {e}")
+
+            if on_progress and total_tasks > 0:
+                pct = int((completed + failed) * 100 / total_tasks)
+                on_progress(
+                    pct,
+                    "Evaluating",
+                    f"{completed + failed}/{total_tasks} responses processed ({failed} errors)",
+                )
+
+    print(f"\nCompleted: {completed}/{total_tasks} ({failed} errors)")
+    return results
+
+
 def save_results(results: List[BenchmarkResult], output_path: Path) -> None:
     """Save benchmark results to JSONL file."""
 
@@ -1400,6 +1642,43 @@ def run_benchmark_pipeline(
     qpath = Path(queries_path)
     if not qpath.exists():
         raise FileNotFoundError(f"Queries file not found: {qpath}")
+
+    evaluate_only_mode = detect_evaluate_only_mode(qpath)
+
+    if evaluate_only_mode:
+        records = load_response_records(qpath)
+        if not records:
+            raise ValueError("No valid response records loaded from file")
+
+        if limit and limit > 0:
+            original_count = len(records)
+            records = records[:limit]
+            print(f"Limited to {len(records)} records (from {original_count})")
+
+        progress(
+            10,
+            "Running evaluate-only",
+            f"Scoring {len(records)} existing responses",
+        )
+
+        def eval_progress(pct, step, msg):
+            scaled = 10 + int(pct * 80 / 100)
+            progress(scaled, step, msg)
+
+        results = run_evaluation_only(
+            records=records,
+            concurrency=concurrency,
+            progress=show_progress,
+            on_progress=eval_progress if on_progress else None,
+            eval_config=eval_config,
+        )
+
+        progress(92, "Saving results", f"Writing {len(results)} results to {output_path}")
+        out = Path(output_path)
+        save_results(results, out)
+        progress(96, "Summary", "Generating summary")
+        print_summary(results)
+        return results
 
     queries = load_queries(qpath)
     if not queries:
@@ -1528,12 +1807,12 @@ After benchmarking, train directly (category is preserved from input):
         "--queries",
         type=str,
         required=True,
-        help="Path to JSONL input file. Can be simple queries or existing training data. "
-        "Unique queries are extracted automatically. Supports: query, ground_truth, category fields.",
+        help="Path to JSONL input file. If rows include response, runs evaluate-only mode; "
+        "otherwise runs normal benchmark mode.",
     )
 
     # Model specification (mutually exclusive)
-    model_group = parser.add_mutually_exclusive_group(required=True)
+    model_group = parser.add_mutually_exclusive_group(required=False)
     model_group.add_argument(
         "--models",
         type=str,
@@ -1563,7 +1842,7 @@ After benchmarking, train directly (category is preserved from input):
         "--output",
         type=str,
         default="benchmark_output.jsonl",
-        help="Output file path (default: benchmark_output.jsonl)",
+        help="Output file path (must be different from --queries; default: benchmark_output.jsonl)",
     )
     parser.add_argument(
         "--max-tokens",
@@ -1694,11 +1973,37 @@ After benchmarking, train directly (category is preserved from input):
 
     args = parser.parse_args()
 
+    # Safety guard: never overwrite the input file.
+    queries_abs = Path(args.queries).expanduser().resolve()
+    output_abs = Path(args.output).expanduser().resolve()
+    if queries_abs == output_abs:
+        print(
+            "Error: --output must be a new file and cannot be the same as --queries"
+        )
+        sys.exit(1)
+
+    evaluate_only_input = False
+    try:
+        if queries_abs.exists():
+            evaluate_only_input = detect_evaluate_only_mode(queries_abs)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
+    if not evaluate_only_input and not args.models and not args.model_config:
+        print("Error: benchmark mode requires either --models or --model-config")
+        sys.exit(1)
+
+    if evaluate_only_input and (args.models or args.model_config):
+        print(
+            "Warning: evaluate-only input detected; --models/--model-config are ignored"
+        )
+
     # Determine model list for simple mode
     models_list = None
     if args.models:
         models_list = [m.strip() for m in args.models.split(",") if m.strip()]
-        if not models_list:
+        if not models_list and not evaluate_only_input:
             print("Error: No models specified")
             sys.exit(1)
 
