@@ -39,6 +39,22 @@ cd src/training/model_selection/ml_model_selection
 pip install -r requirements.txt
 ```
 
+## Generate queries.jsonl From Existing JSONL
+
+If you already have a training or benchmark JSONL file and only need `query`, `ground_truth`, and `category`, use the helper script:
+
+```bash
+./extract_queries_jsonl.sh input.jsonl queries.jsonl
+```
+
+Or use a bash one-liner with `jq`:
+
+```bash
+jq -cs 'reduce .[] as $row ({out: [], seen: {}}; ($row | {query: .query, ground_truth: .ground_truth, category: (.category // null)}) as $item | if .seen[$item.query] == null then .seen[$item.query] = $item | .out += [$item] elif .seen[$item.query] != $item then error("conflicting ground_truth/category for query: " + $item.query) else . end) | .out[]' input.jsonl > queries.jsonl
+```
+
+The script requires `query` and `ground_truth`, preserves input order while deduplicating by `query`, and fails if the same query appears with conflicting `ground_truth` or `category` values.
+
 ## Quick Start
 
 ### Option 0: Dashboard GUI (Recommended for New Users)
