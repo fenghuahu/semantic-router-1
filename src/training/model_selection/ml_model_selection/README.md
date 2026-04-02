@@ -41,19 +41,36 @@ pip install -r requirements.txt
 
 ## Generate queries.jsonl From Existing JSONL
 
-If you already have a training or benchmark JSONL file and only need `query`, `ground_truth`, and `category`, use the helper script:
+If you already have a training or benchmark JSONL file and only need `query`, `ground_truth`, and `category`, use the helper script with `--keep`:
 
 ```bash
-./extract_queries_jsonl.sh input.jsonl queries.jsonl
+python extract_queries_jsonl.py input.jsonl queries.jsonl \
+  --keep query,ground_truth,category
 ```
 
-Or use a bash one-liner with `jq`:
+You can also keep a custom field set:
 
 ```bash
-jq -cs 'reduce .[] as $row ({out: [], seen: {}}; ($row | {query: .query, ground_truth: .ground_truth, category: (.category // null)}) as $item | if .seen[$item.query] == null then .seen[$item.query] = $item | .out += [$item] elif .seen[$item.query] != $item then error("conflicting ground_truth/category for query: " + $item.query) else . end) | .out[]' input.jsonl > queries.jsonl
+python extract_queries_jsonl.py input.jsonl queries.jsonl \
+  --keep query,ground_truth,category,task_name,metric
 ```
 
-The script requires `query` and `ground_truth`, preserves input order while deduplicating by `query`, and fails if the same query appears with conflicting `ground_truth` or `category` values.
+Or drop a few fields and keep everything else from the input rows:
+
+```bash
+python extract_queries_jsonl.py input.jsonl queries.jsonl \
+  --drop response,response_time,performance
+```
+
+Rules:
+
+- You must specify exactly one of `--keep` or `--drop`
+- If you specify `--keep`, only those fields are retained
+- If you specify `--drop`, all input fields are retained except those listed in `--drop`
+- `--keep` and `--drop` cannot be used together
+- `query` is required and cannot be dropped
+
+The script deduplicates by `query`, preserves input order, and fails if the retained fields conflict for the same query.
 
 ## Quick Start
 
