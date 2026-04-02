@@ -21,6 +21,9 @@ Usage:
     # Simple: All models on same endpoint (e.g., vLLM or Ollama)
     python benchmark.py --queries queries.jsonl --models llama3.2:1b,mistral:7b
 
+    # Simple mode with explicit thinking control for supported model families
+    python benchmark.py --queries queries.jsonl --models qwen3:8b --enable-thinking
+
     # Different endpoints/auth per model: Use config file
     python benchmark.py --queries queries.jsonl --model-config models.yaml
 
@@ -31,6 +34,7 @@ Config file format (models.yaml):
     models:
       - name: llama3.2:1b
         endpoint: http://localhost:11434/v1  # Ollama
+                enable_thinking: false  # Optional: controls chat_template_kwargs thinking flag
 
       - name: llama3.2:3b
         endpoint: http://localhost:11434/v1
@@ -93,6 +97,8 @@ class ModelConfig:
     headers: Optional[Dict[str, str]] = None
     max_tokens: int = 1024
     temperature: float = 0.0
+    enable_thinking: Optional[bool] = None
+    thinking_parameter: str = "auto"
 
     def get_client(self) -> OpenAI:
         """Create OpenAI client for this model."""
@@ -177,6 +183,8 @@ def load_model_configs(config_path: Path) -> List[ModelConfig]:
             headers=model_data.get("headers"),
             max_tokens=model_data.get("max_tokens", 1024),
             temperature=model_data.get("temperature", 0.0),
+            enable_thinking=model_data.get("enable_thinking"),
+            thinking_parameter=model_data.get("thinking_parameter", "auto"),
         )
         configs.append(config)
 
@@ -189,6 +197,8 @@ def create_model_configs_from_list(
     api_key: str,
     max_tokens: int = 1024,
     temperature: float = 0.0,
+    enable_thinking: Optional[bool] = None,
+    thinking_parameter: str = "auto",
 ) -> List[ModelConfig]:
     """Create model configs from simple comma-separated list."""
     return [
@@ -198,9 +208,54 @@ def create_model_configs_from_list(
             api_key=api_key,
             max_tokens=max_tokens,
             temperature=temperature,
+            enable_thinking=enable_thinking,
+            thinking_parameter=thinking_parameter,
         )
         for model in models
     ]
+
+
+def _resolve_thinking_parameter(model_name: str, configured_parameter: str) -> Optional[str]:
+    """Resolve which request field should carry the thinking flag."""
+    parameter = (configured_parameter or "auto").strip().lower()
+    if parameter and parameter != "auto":
+        return parameter
+
+    model_name_lower = model_name.lower()
+    if "qwen3" in model_name_lower:
+        return "enable_thinking"
+    if "deepseek" in model_name_lower or model_name_lower.startswith("ds"):
+        return "thinking"
+
+    return None
+
+
+def _build_completion_request(
+    model_config: ModelConfig,
+    query_text: str,
+    max_tokens: int,
+) -> Dict[str, Any]:
+    """Build chat completion request arguments, including optional thinking control."""
+    request: Dict[str, Any] = {
+        "model": model_config.name,
+        "messages": [{"role": "user", "content": query_text}],
+        "max_tokens": max_tokens,
+        "temperature": model_config.temperature,
+    }
+
+    if model_config.enable_thinking is not None:
+        thinking_parameter = _resolve_thinking_parameter(
+            model_config.name,
+            model_config.thinking_parameter,
+        )
+        if thinking_parameter is not None:
+            request["extra_body"] = {
+                "chat_template_kwargs": {
+                    thinking_parameter: model_config.enable_thinking,
+                }
+            }
+
+    return request
 
 
 @dataclass
@@ -1296,10 +1351,11 @@ def benchmark_query(
 
     try:
         response = client.chat.completions.create(
-            model=model_config.name,
-            messages=[{"role": "user", "content": query_text}],
-            max_tokens=max_tokens,
-            temperature=model_config.temperature,
+            **_build_completion_request(
+                model_config=model_config,
+                query_text=query_text,
+                max_tokens=max_tokens,
+            )
         )
 
         response_text = response.choices[0].message.content or ""
@@ -1609,6 +1665,8 @@ def run_benchmark_pipeline(
     show_progress: bool = True,
     on_progress=None,
     eval_config: Optional[EvalConfig] = None,
+    enable_thinking: Optional[bool] = None,
+    thinking_parameter: str = "auto",
 ) -> List[BenchmarkResult]:
     """
     Run the full benchmark pipeline: load queries -> load models -> benchmark -> save.
@@ -1631,6 +1689,8 @@ def run_benchmark_pipeline(
         show_progress: Show progress bar (tqdm).
         on_progress: Optional callback(percent, step, message) for progress.
         eval_config: Optional configuration for judge-based evaluation.
+        enable_thinking: Optional thinking flag for models created via `--models`.
+        thinking_parameter: Request parameter used for thinking control.
 
     Returns:
         List of BenchmarkResult objects.
@@ -1712,6 +1772,8 @@ def run_benchmark_pipeline(
             api_key=api_key,
             max_tokens=max_tokens,
             temperature=temperature,
+            enable_thinking=enable_thinking,
+            thinking_parameter=thinking_parameter,
         )
     else:
         raise ValueError("Either models_yaml_path or models_list must be provided")
@@ -1774,6 +1836,9 @@ Examples:
 
   # Simple: All models on same endpoint (local vLLM)
   python benchmark.py --queries queries.jsonl --models llama-3.2-1b,mistral-7b
+
+    # Simple mode with thinking enabled for supported models such as Qwen3
+    python benchmark.py --queries queries.jsonl --models qwen3-8b --enable-thinking
 
   # With custom endpoint and API key (OpenAI)
   python benchmark.py --queries queries.jsonl --models gpt-4 \\
@@ -1859,6 +1924,23 @@ After benchmarking, train directly (category is preserved from input):
         type=float,
         default=0.0,
         help="Temperature for generation (default: 0.0, used with --models)",
+    )
+    parser.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        help="When using --models, send a thinking-enabled flag for supported model families",
+    )
+    parser.add_argument(
+        "--disable-thinking",
+        action="store_true",
+        help="When using --models, send a thinking-disabled flag for supported model families",
+    )
+    parser.add_argument(
+        "--thinking-parameter",
+        type=str,
+        default="auto",
+        choices=["auto", "enable_thinking", "thinking"],
+        help="Request parameter used for thinking control in --models mode (default: auto)",
     )
     parser.add_argument(
         "--concurrency",
@@ -1998,6 +2080,17 @@ After benchmarking, train directly (category is preserved from input):
         print("Error: benchmark mode requires either --models or --model-config")
         sys.exit(1)
 
+    if args.enable_thinking and args.disable_thinking:
+        print("Error: --enable-thinking and --disable-thinking cannot be used together")
+        sys.exit(1)
+
+    if (args.enable_thinking or args.disable_thinking) and not args.models:
+        print("Warning: thinking mode flags are only applied when using --models")
+
+    args.enable_thinking = (
+        True if args.enable_thinking else False if args.disable_thinking else None
+    )
+
     if evaluate_only_input and (args.models or args.model_config):
         print(
             "Warning: evaluate-only input detected; --models/--model-config are ignored"
@@ -2060,6 +2153,8 @@ After benchmarking, train directly (category is preserved from input):
             limit=args.limit or 0,
             show_progress=not args.no_progress,
             eval_config=eval_config,
+            enable_thinking=args.enable_thinking,
+            thinking_parameter=args.thinking_parameter,
         )
     except (FileNotFoundError, ValueError) as e:
         print(f"Error: {e}")
