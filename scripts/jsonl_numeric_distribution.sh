@@ -22,13 +22,15 @@ Options:
   --bins N                Number of buckets (default: 10)
   --min VALUE             Histogram lower bound (default: 0)
   --max VALUE             Histogram upper bound (default: 1)
-  --split-exact VALUE     Put an exact numeric value in its own bucket
+    --split-exact VALUE     Put an exact numeric value in its own bucket
+                                                    Can be repeated, e.g. --split-exact 0 --split-exact 1.0
   --no-histogram          Skip text bars and print counts only
   -h, --help              Show this help
 
 Examples:
   ./scripts/jsonl_numeric_distribution.sh data.jsonl performance
   ./scripts/jsonl_numeric_distribution.sh data.jsonl performance --split-exact 1.0
+    ./scripts/jsonl_numeric_distribution.sh data.jsonl performance --split-exact 0 --split-exact 1.0
   ./scripts/jsonl_numeric_distribution.sh data.jsonl score.value --bins 20 --min 0 --max 100
 EOF
 }
@@ -45,7 +47,7 @@ shift 2
 bins=10
 min_value=0
 max_value=1
-split_exact=""
+split_exact_values=()
 show_histogram=1
 
 while [[ $# -gt 0 ]]; do
@@ -63,7 +65,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --split-exact)
-            split_exact="$2"
+            split_exact_values+=("$2")
             shift 2
             ;;
         --no-histogram)
@@ -105,11 +107,16 @@ fi
 
 jq_filter="select(${jq_field} != null) | ${jq_field}"
 
+split_exact_csv=""
+if [[ ${#split_exact_values[@]} -gt 0 ]]; then
+    split_exact_csv="$(IFS=,; echo "${split_exact_values[*]}")"
+fi
+
 jq -re "$jq_filter" "$jsonl_file" | awk \
     -v bins="$bins" \
     -v min_value="$min_value" \
     -v max_value="$max_value" \
-    -v split_exact="$split_exact" \
+    -v split_exact_csv="$split_exact_csv" \
     -v show_histogram="$show_histogram" \
     -v field_label="$field_input" '
 function abs_value(x) {
@@ -145,29 +152,52 @@ BEGIN {
     in_range = 0
     lower_outliers = 0
     upper_outliers = 0
-    split_count = 0
-    use_split = (split_exact != "")
+    use_split = (split_exact_csv != "")
+
+    split_values_count = 0
+    if (use_split) {
+        split_values_count = split(split_exact_csv, split_tokens, /,/)
+        for (i = 1; i <= split_values_count; i++) {
+            token = split_tokens[i]
+            if (token == "") {
+                continue
+            }
+            split_order[++split_order_len] = token
+            split_value_num[token] = token + 0
+            split_count[token] = 0
+        }
+    }
 }
 
 {
     value = $1 + 0
     total++
 
-    if (use_split && almost_equal(value, split_exact + 0)) {
-        split_count++
-        raw_values[in_range + split_count - 1] = value
-        next
+    if (use_split) {
+        for (s = 1; s <= split_order_len; s++) {
+            split_key = split_order[s]
+            if (almost_equal(value, split_value_num[split_key])) {
+                split_count[split_key]++
+                raw_values[total - 1] = value
+                next_record = 1
+                break
+            }
+        }
+        if (next_record) {
+            next_record = 0
+            next
+        }
     }
 
     if (value < min_value) {
         lower_outliers++
-        raw_values[in_range + split_count + lower_outliers + upper_outliers - 1] = value
+        raw_values[total - 1] = value
         next
     }
 
     if (value > max_value) {
         upper_outliers++
-        raw_values[in_range + split_count + lower_outliers + upper_outliers - 1] = value
+        raw_values[total - 1] = value
         next
     }
 
@@ -177,7 +207,7 @@ BEGIN {
     }
     counts[bucket]++
     in_range++
-    raw_values[in_range + split_count + lower_outliers + upper_outliers - 1] = value
+    raw_values[total - 1] = value
 }
 
 END {
@@ -199,11 +229,20 @@ END {
     }
     mean = sum / total
 
-    max_bucket_count = split_count
+    max_bucket_count = 0
     for (i = 0; i < bins; i++) {
         current = counts[i] + 0
         if (current > max_bucket_count) {
             max_bucket_count = current
+        }
+    }
+    if (use_split) {
+        for (s = 1; s <= split_order_len; s++) {
+            split_key = split_order[s]
+            current = split_count[split_key] + 0
+            if (current > max_bucket_count) {
+                max_bucket_count = current
+            }
         }
     }
 
@@ -233,16 +272,20 @@ END {
     }
 
     if (use_split) {
-        pct = 100 * split_count / total
-        if (show_histogram && max_bucket_count > 0) {
-            bar_len = int(split_count * 40 / max_bucket_count)
-            bar = ""
-            for (j = 0; j < bar_len; j++) {
-                bar = bar "#"
+        for (s = 1; s <= split_order_len; s++) {
+            split_key = split_order[s]
+            split_value = split_count[split_key] + 0
+            pct = 100 * split_value / total
+            if (show_histogram && max_bucket_count > 0) {
+                bar_len = int(split_value * 40 / max_bucket_count)
+                bar = ""
+                for (j = 0; j < bar_len; j++) {
+                    bar = bar "#"
+                }
+                printf "[%s]%*s %6d %7.2f%% %s\n", split_key, 14 - length(split_key), " ", split_value, pct, bar
+            } else {
+                printf "[%s]%*s %6d %7.2f%%\n", split_key, 14 - length(split_key), " ", split_value, pct
             }
-            printf "[%s]%*s %6d %7.2f%% %s\n", split_exact, 14 - length(split_exact), " ", split_count, pct, bar
-        } else {
-            printf "[%s]%*s %6d %7.2f%%\n", split_exact, 14 - length(split_exact), " ", split_count, pct
         }
     }
 
