@@ -6,7 +6,6 @@ specific `model_name`, then sets:
 - `response` to null
 - `response_time` to 0
 - `performance` to 0.0
-- `metric` to null
 
 Then writes the updated records to a new JSONL file.
 
@@ -81,7 +80,6 @@ def reset_jsonl_fields(
             record["response"] = None
             record["response_time"] = 0
             record["performance"] = 0.0
-            record["metric"] = None
 
             outfile.write(json.dumps(record, ensure_ascii=False) + "\n")
             processed += 1
