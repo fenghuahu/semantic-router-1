@@ -44,6 +44,8 @@ Config file format (models.yaml):
         headers:
           Authorization: Bearer ${CUSTOM_TOKEN}
           X-Custom-Header: value
+                enable_thinking: false
+                enable_thinking_format: chat_template_kwargs  # or: direct
 
 Output is training-ready (includes category if present in input):
     {"query": "...", "model_name": "...", "performance": 0.85, "response_time": 1.2, "category": "math"}
@@ -83,6 +85,29 @@ except ImportError:
         return iterable
 
 
+ENABLE_THINKING_FORMAT_DIRECT = "direct"
+ENABLE_THINKING_FORMAT_CHAT_TEMPLATE_KWARGS = "chat_template_kwargs"
+ENABLE_THINKING_FORMAT_CHOICES = {
+    ENABLE_THINKING_FORMAT_DIRECT,
+    ENABLE_THINKING_FORMAT_CHAT_TEMPLATE_KWARGS,
+}
+
+
+def _normalize_enable_thinking_format(value: Optional[str], context: str) -> str:
+    """Normalize and validate enable_thinking payload format."""
+    if value is None:
+        return ENABLE_THINKING_FORMAT_DIRECT
+
+    normalized = value.strip().lower()
+    if normalized not in ENABLE_THINKING_FORMAT_CHOICES:
+        allowed = ", ".join(sorted(ENABLE_THINKING_FORMAT_CHOICES))
+        raise ValueError(
+            f"Invalid enable_thinking_format '{value}' for {context}. "
+            f"Allowed values: {allowed}"
+        )
+    return normalized
+
+
 @dataclass
 class ModelConfig:
     """Configuration for a single model."""
@@ -93,6 +118,8 @@ class ModelConfig:
     headers: Optional[Dict[str, str]] = None
     max_tokens: int = 1024
     temperature: float = 0.0
+    enable_thinking: Optional[bool] = None
+    enable_thinking_format: str = ENABLE_THINKING_FORMAT_DIRECT
 
     def get_client(self) -> OpenAI:
         """Create OpenAI client for this model."""
@@ -177,6 +204,11 @@ def load_model_configs(config_path: Path) -> List[ModelConfig]:
             headers=model_data.get("headers"),
             max_tokens=model_data.get("max_tokens", 1024),
             temperature=model_data.get("temperature", 0.0),
+            enable_thinking=model_data.get("enable_thinking"),
+            enable_thinking_format=_normalize_enable_thinking_format(
+                model_data.get("enable_thinking_format"),
+                f"model '{model_data['name']}'",
+            ),
         )
         configs.append(config)
 
@@ -189,6 +221,8 @@ def create_model_configs_from_list(
     api_key: str,
     max_tokens: int = 1024,
     temperature: float = 0.0,
+    enable_thinking: Optional[bool] = None,
+    enable_thinking_format: str = ENABLE_THINKING_FORMAT_DIRECT,
 ) -> List[ModelConfig]:
     """Create model configs from simple comma-separated list."""
     return [
@@ -198,6 +232,8 @@ def create_model_configs_from_list(
             api_key=api_key,
             max_tokens=max_tokens,
             temperature=temperature,
+            enable_thinking=enable_thinking,
+            enable_thinking_format=enable_thinking_format,
         )
         for model in models
     ]
@@ -282,8 +318,9 @@ def format_concise_query(
     Similar to Go benchmark runner's formatQueryForTask.
     """
     # Multiple choice questions
-    if choices or metric == "em_mc":
-        return f"Answer with ONLY the letter of the correct choice (A, B, C, or D). Do not explain.\n\nQuestion: {query}"
+    # if choices or metric == "em_mc":
+    if metric == "em_mc":
+        return f"Answer with ONLY the letter of the correct choice (A, B, C, or D). Do not explain.\n\nQuestion: {query}\n\nChoices: {choices}"
 
     # Math problems
     if metric in ("MATH", "GSM8K"):
@@ -294,6 +331,10 @@ def format_concise_query(
     # Code generation
     if metric == "code_eval":
         return f"Write code to solve this problem. Output ONLY the code, no explanations:\n\n{query}"
+
+    # commongen_coverage
+    if metric == "commongen_coverage":
+        return f"Given the following concepts, write a coherent and natural sentence that includes all the concepts:\n\nConcepts: {query}"
 
     # QA and general questions
     return f"Answer the following question concisely in one sentence:\n\n{query}"
@@ -1286,7 +1327,8 @@ def benchmark_query(
     # Format query with concise prompts if enabled
     # But skip concise for code_eval - code needs full response
     query_text = query.query
-    if concise and query.metric != "code_eval":
+    # if concise and query.metric != "code_eval":
+    if concise:
         query_text = format_concise_query(query.query, query.metric, query.choices)
 
     # Use higher max_tokens for code_eval (code needs more tokens)
@@ -1295,12 +1337,28 @@ def benchmark_query(
         max_tokens = 256
 
     try:
-        response = client.chat.completions.create(
-            model=model_config.name,
-            messages=[{"role": "user", "content": query_text}],
-            max_tokens=max_tokens,
-            temperature=model_config.temperature,
-        )
+        request_kwargs: Dict[str, Any] = {
+            "model": model_config.name,
+            "messages": [{"role": "user", "content": query_text}],
+            "max_tokens": max_tokens,
+            "temperature": model_config.temperature,
+        }
+        if model_config.enable_thinking is not None:
+            if (
+                model_config.enable_thinking_format
+                == ENABLE_THINKING_FORMAT_CHAT_TEMPLATE_KWARGS
+            ):
+                request_kwargs["extra_body"] = {
+                    "chat_template_kwargs": {
+                        "enable_thinking": model_config.enable_thinking
+                    }
+                }
+            else:
+                request_kwargs["extra_body"] = {
+                    "enable_thinking": model_config.enable_thinking
+                }
+
+        response = client.chat.completions.create(**request_kwargs)
 
         response_text = response.choices[0].message.content or ""
         success = True
@@ -1604,6 +1662,8 @@ def run_benchmark_pipeline(
     concurrency: int = 4,
     max_tokens: int = 1024,
     temperature: float = 0.0,
+    enable_thinking: Optional[bool] = None,
+    enable_thinking_format: Optional[str] = None,
     concise: bool = False,
     limit: int = 0,
     show_progress: bool = True,
@@ -1626,6 +1686,8 @@ def run_benchmark_pipeline(
         concurrency: Number of concurrent requests.
         max_tokens: Max tokens in response.
         temperature: Temperature for generation.
+        enable_thinking: Optional thinking mode flag to send in request body.
+        enable_thinking_format: Optional payload format override for enable_thinking.
         concise: Use concise prompts.
         limit: Limit number of queries (0 = no limit).
         show_progress: Show progress bar (tqdm).
@@ -1639,6 +1701,13 @@ def run_benchmark_pipeline(
     def progress(pct, step, msg):
         if on_progress:
             on_progress(pct, step, msg)
+
+    normalized_enable_thinking_format: Optional[str] = None
+    if enable_thinking_format is not None:
+        normalized_enable_thinking_format = _normalize_enable_thinking_format(
+            enable_thinking_format,
+            "pipeline override",
+        )
 
     progress(5, "Starting benchmark", "Loading queries and model configs")
 
@@ -1704,6 +1773,10 @@ def run_benchmark_pipeline(
         for mc in model_configs:
             mc.max_tokens = max_tokens
             mc.temperature = temperature
+            if enable_thinking is not None:
+                mc.enable_thinking = enable_thinking
+            if normalized_enable_thinking_format is not None:
+                mc.enable_thinking_format = normalized_enable_thinking_format
         print(f"Loaded {len(model_configs)} model configurations from {config_path}")
     elif models_list:
         model_configs = create_model_configs_from_list(
@@ -1712,6 +1785,11 @@ def run_benchmark_pipeline(
             api_key=api_key,
             max_tokens=max_tokens,
             temperature=temperature,
+            enable_thinking=enable_thinking,
+            enable_thinking_format=(
+                normalized_enable_thinking_format
+                or ENABLE_THINKING_FORMAT_DIRECT
+            ),
         )
     else:
         raise ValueError("Either models_yaml_path or models_list must be provided")
@@ -1761,6 +1839,16 @@ def run_benchmark_pipeline(
 
 
 def main():
+    def _parse_bool_arg(value: str) -> bool:
+        v = value.strip().lower()
+        if v in {"1", "true", "t", "yes", "y", "on"}:
+            return True
+        if v in {"0", "false", "f", "no", "n", "off"}:
+            return False
+        raise argparse.ArgumentTypeError(
+            f"Invalid boolean value: {value}. Use true/false."
+        )
+
     parser = argparse.ArgumentParser(
         description="Benchmark LLMs for ML model selection training",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1801,6 +1889,8 @@ Config file format (models.yaml) - supports Ollama, vLLM, OpenAI, etc:
       endpoint: https://custom.api.com/v1
       headers:
         Authorization: Bearer ${CUSTOM_TOKEN}
+            enable_thinking: false
+            enable_thinking_format: chat_template_kwargs  # or: direct
 
 After benchmarking, train directly (category is preserved from input):
   python train.py --data-file benchmark_output.jsonl --output-dir models/ --device cuda
@@ -1859,6 +1949,24 @@ After benchmarking, train directly (category is preserved from input):
         type=float,
         default=0.0,
         help="Temperature for generation (default: 0.0, used with --models)",
+    )
+    parser.add_argument(
+        "--enable-thinking",
+        type=_parse_bool_arg,
+        default=None,
+        help="Set enable_thinking value (true/false). "
+        "When provided, --enable-thinking-format is required. "
+        "When omitted, do not send this field.",
+    )
+    parser.add_argument(
+        "--enable-thinking-format",
+        type=str,
+        choices=sorted(ENABLE_THINKING_FORMAT_CHOICES),
+        default=None,
+        help="Request payload format for --enable-thinking. "
+        "direct -> extra_body.enable_thinking; "
+        "chat_template_kwargs -> extra_body.chat_template_kwargs.enable_thinking. "
+        "When set, this overrides per-model YAML config.",
     )
     parser.add_argument(
         "--concurrency",
@@ -1948,8 +2056,8 @@ After benchmarking, train directly (category is preserved from input):
     parser.add_argument(
         "--eval-timeout-seconds",
         type=int,
-        default=20,
-        help="Judge request timeout in seconds (default: 20)",
+        default=300,
+        help="Judge request timeout in seconds (default: 300)",
     )
     parser.add_argument(
         "--eval-concurrency",
@@ -1976,6 +2084,12 @@ After benchmarking, train directly (category is preserved from input):
     )
 
     args = parser.parse_args()
+
+    if args.enable_thinking is not None and args.enable_thinking_format is None:
+        parser.error(
+            "--enable-thinking requires --enable-thinking-format "
+            "(direct or chat_template_kwargs)"
+        )
 
     # Safety guard: never overwrite the input file.
     queries_abs = Path(args.queries).expanduser().resolve()
@@ -2056,6 +2170,8 @@ After benchmarking, train directly (category is preserved from input):
             concurrency=args.concurrency,
             max_tokens=args.max_tokens,
             temperature=args.temperature,
+            enable_thinking=args.enable_thinking,
+            enable_thinking_format=args.enable_thinking_format,
             concise=args.concise,
             limit=args.limit or 0,
             show_progress=not args.no_progress,
