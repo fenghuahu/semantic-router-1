@@ -1410,12 +1410,15 @@ def run_benchmark(
     concise: bool = False,
     on_progress=None,
     eval_config: Optional[EvalConfig] = None,
+    output_path: Optional[Path] = None,
 ) -> List[BenchmarkResult]:
     """Run benchmark for all queries against all models.
 
     Args:
         on_progress: Optional callback(percent, step, message) called as tasks complete.
                      percent ranges 0-100 within the benchmark phase.
+        output_path: Optional JSONL output path. When set, results are written
+                     incrementally in deterministic task order.
     """
 
     results: List[Optional[BenchmarkResult]] = []
@@ -1446,56 +1449,82 @@ def run_benchmark(
 
     completed = 0
     failed = 0
+    written = 0
+    next_to_write = 0
+    finished: List[bool] = [False] * total_tasks
     judge_semaphore: Optional[threading.Semaphore] = None
     eval_client: Optional[OpenAI] = None
     if eval_config is not None and eval_config.mode != "rule_only":
         judge_semaphore = threading.Semaphore(max(1, eval_config.concurrency))
         eval_client = eval_config.get_client()
 
-    with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures: Dict[Any, Tuple[int, QueryRecord, ModelConfig]] = {}
+    output_file = None
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_file = open(output_path, "w", encoding="utf-8")
 
-        for idx, (query, model_config) in enumerate(tasks):
-            future = executor.submit(
-                benchmark_query,
-                model_config,
-                query,
-                concise,
-                eval_config,
-                eval_client,
-                judge_semaphore,
-            )
-            futures[future] = (idx, query, model_config)
+    try:
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures: Dict[Any, Tuple[int, QueryRecord, ModelConfig]] = {}
 
-        # Process results as they complete
-        iterator = as_completed(futures)
-        if progress:
-            iterator = tqdm(iterator, total=total_tasks, desc="Benchmarking")
+            for idx, (query, model_config) in enumerate(tasks):
+                future = executor.submit(
+                    benchmark_query,
+                    model_config,
+                    query,
+                    concise,
+                    eval_config,
+                    eval_client,
+                    judge_semaphore,
+                )
+                futures[future] = (idx, query, model_config)
 
-        for future in iterator:
-            idx, query, model_config = futures[future]
-            try:
-                result = future.result()
-                results[idx] = result
-                completed += 1
+            # Process results as they complete
+            iterator = as_completed(futures)
+            if progress:
+                iterator = tqdm(iterator, total=total_tasks, desc="Benchmarking")
 
-                if result.performance == 0.0 and "Error" in result.response:
+            for future in iterator:
+                idx, query, model_config = futures[future]
+                try:
+                    result = future.result()
+                    results[idx] = result
+                    completed += 1
+
+                    if result.performance == 0.0 and "Error" in result.response:
+                        failed += 1
+
+                    # Report per-task progress (scale 0-100 within this function)
+                    if on_progress and total_tasks > 0:
+                        pct = int(completed * 100 / total_tasks)
+                        on_progress(
+                            pct,
+                            "Benchmarking",
+                            f"{completed}/{total_tasks} queries completed ({failed} errors)",
+                        )
+
+                except Exception as e:
+                    print(f"\nError processing {model_config.name}: {e}")
                     failed += 1
-
-                # Report per-task progress (scale 0-100 within this function)
-                if on_progress and total_tasks > 0:
-                    pct = int(completed * 100 / total_tasks)
-                    on_progress(
-                        pct,
-                        "Benchmarking",
-                        f"{completed}/{total_tasks} queries completed ({failed} errors)",
-                    )
-
-            except Exception as e:
-                print(f"\nError processing {model_config.name}: {e}")
-                failed += 1
+                finally:
+                    finished[idx] = True
+                    if output_file is not None:
+                        while next_to_write < total_tasks and finished[next_to_write]:
+                            pending_result = results[next_to_write]
+                            if pending_result is not None:
+                                output_file.write(
+                                    json.dumps(pending_result.to_jsonl_dict()) + "\n"
+                                )
+                                output_file.flush()
+                                written += 1
+                            next_to_write += 1
+    finally:
+        if output_file is not None:
+            output_file.close()
 
     print(f"\nCompleted: {completed}/{total_tasks} ({failed} errors)")
+    if output_path is not None:
+        print(f"Stream-saved {written} results to {output_path}")
 
     ordered_results = [r for r in results if r is not None]
     return ordered_results
@@ -1539,6 +1568,7 @@ def run_evaluation_only(
     progress: bool = True,
     on_progress=None,
     eval_config: Optional[EvalConfig] = None,
+    output_path: Optional[Path] = None,
 ) -> List[BenchmarkResult]:
     """Evaluate already-generated responses without querying any model endpoint."""
 
@@ -1551,46 +1581,72 @@ def run_evaluation_only(
     results: List[Optional[BenchmarkResult]] = [None] * total_tasks
     completed = 0
     failed = 0
+    written = 0
+    next_to_write = 0
+    finished: List[bool] = [False] * total_tasks
     judge_semaphore: Optional[threading.Semaphore] = None
     eval_client: Optional[OpenAI] = None
     if eval_config is not None and eval_config.mode != "rule_only":
         judge_semaphore = threading.Semaphore(max(1, eval_config.concurrency))
         eval_client = eval_config.get_client()
 
-    with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures: Dict[Any, int] = {}
-        for idx, record in enumerate(records):
-            future = executor.submit(
-                _evaluate_existing_record,
-                record,
-                eval_config,
-                eval_client,
-                judge_semaphore,
-            )
-            futures[future] = idx
+    output_file = None
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_file = open(output_path, "w", encoding="utf-8")
 
-        iterator = as_completed(futures)
-        if progress:
-            iterator = tqdm(iterator, total=total_tasks, desc="Evaluating")
-
-        for future in iterator:
-            try:
-                idx = futures[future]
-                results[idx] = future.result()
-                completed += 1
-            except Exception as e:
-                failed += 1
-                print(f"\nError evaluating existing response: {e}")
-
-            if on_progress and total_tasks > 0:
-                pct = int((completed + failed) * 100 / total_tasks)
-                on_progress(
-                    pct,
-                    "Evaluating",
-                    f"{completed + failed}/{total_tasks} responses processed ({failed} errors)",
+    try:
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures: Dict[Any, int] = {}
+            for idx, record in enumerate(records):
+                future = executor.submit(
+                    _evaluate_existing_record,
+                    record,
+                    eval_config,
+                    eval_client,
+                    judge_semaphore,
                 )
+                futures[future] = idx
+
+            iterator = as_completed(futures)
+            if progress:
+                iterator = tqdm(iterator, total=total_tasks, desc="Evaluating")
+
+            for future in iterator:
+                idx = futures[future]
+                try:
+                    results[idx] = future.result()
+                    completed += 1
+                except Exception as e:
+                    failed += 1
+                    print(f"\nError evaluating existing response: {e}")
+                finally:
+                    finished[idx] = True
+                    if output_file is not None:
+                        while next_to_write < total_tasks and finished[next_to_write]:
+                            pending_result = results[next_to_write]
+                            if pending_result is not None:
+                                output_file.write(
+                                    json.dumps(pending_result.to_jsonl_dict()) + "\n"
+                                )
+                                output_file.flush()
+                                written += 1
+                            next_to_write += 1
+
+                if on_progress and total_tasks > 0:
+                    pct = int((completed + failed) * 100 / total_tasks)
+                    on_progress(
+                        pct,
+                        "Evaluating",
+                        f"{completed + failed}/{total_tasks} responses processed ({failed} errors)",
+                    )
+    finally:
+        if output_file is not None:
+            output_file.close()
 
     print(f"\nCompleted: {completed}/{total_tasks} ({failed} errors)")
+    if output_path is not None:
+        print(f"Stream-saved {written} results to {output_path}")
     ordered_results = [r for r in results if r is not None]
     return ordered_results
 
@@ -1744,11 +1800,10 @@ def run_benchmark_pipeline(
             progress=show_progress,
             on_progress=eval_progress if on_progress else None,
             eval_config=eval_config,
+            output_path=Path(output_path),
         )
 
-        progress(92, "Saving results", f"Writing {len(results)} results to {output_path}")
-        out = Path(output_path)
-        save_results(results, out)
+        progress(92, "Finalizing output", f"Streamed {len(results)} results to {output_path}")
         progress(96, "Summary", "Generating summary")
         print_summary(results)
         return results
@@ -1822,13 +1877,10 @@ def run_benchmark_pipeline(
         concise=concise,
         on_progress=benchmark_progress if on_progress else None,
         eval_config=eval_config,
+        output_path=Path(output_path),
     )
 
-    progress(92, "Saving results", f"Writing {len(results)} results to {output_path}")
-
-    # Save results
-    out = Path(output_path)
-    save_results(results, out)
+    progress(92, "Finalizing output", f"Streamed {len(results)} results to {output_path}")
 
     progress(96, "Summary", "Generating summary")
 
