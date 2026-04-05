@@ -55,6 +55,7 @@ Then train with:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -64,7 +65,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 try:
     from openai import OpenAI
@@ -551,6 +552,81 @@ def load_response_records(file_path: Path) -> List[ExistingResponseRecord]:
 
     print(f"Loaded {len(records)} response records from {file_path}")
     return records
+
+
+def _build_resume_key(
+    query: str,
+    model_name: str,
+    task_name: Optional[str] = None,
+    metric: Optional[str] = None,
+    ground_truth: Optional[str] = None,
+    choices: Optional[str] = None,
+    category: Optional[str] = None,
+) -> str:
+    """Build a stable task key used for resume-mode deduplication."""
+
+    payload = {
+        "query": query,
+        "model_name": model_name,
+        "task_name": task_name,
+        "metric": metric,
+        "ground_truth": ground_truth,
+        "choices": choices,
+        "category": category,
+    }
+    serialized = json.dumps(
+        payload,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _load_completed_resume_keys(output_path: Optional[Path]) -> Set[str]:
+    """Load completed task keys from an existing JSONL output file."""
+
+    if output_path is None or not output_path.exists():
+        return set()
+
+    completed: Set[str] = set()
+    invalid_lines = 0
+
+    with open(output_path, "r", encoding="utf-8") as f:
+        for line_num, line in enumerate(f, 1):
+            text = line.strip()
+            if not text:
+                continue
+
+            try:
+                row = json.loads(text)
+            except json.JSONDecodeError:
+                invalid_lines += 1
+                continue
+
+            query = row.get("query")
+            model_name = row.get("model_name")
+            if query is None or model_name is None:
+                continue
+
+            completed.add(
+                _build_resume_key(
+                    query=str(query),
+                    model_name=str(model_name),
+                    task_name=row.get("task_name"),
+                    metric=row.get("metric"),
+                    ground_truth=row.get("ground_truth"),
+                    choices=row.get("choices"),
+                    category=row.get("category"),
+                )
+            )
+
+    if invalid_lines:
+        print(
+            f"Warning: Ignored {invalid_lines} invalid JSON lines while loading resume state from {output_path}"
+        )
+
+    return completed
 
 
 def evaluate_response(
@@ -1411,6 +1487,7 @@ def run_benchmark(
     on_progress=None,
     eval_config: Optional[EvalConfig] = None,
     output_path: Optional[Path] = None,
+    resume: bool = False,
 ) -> List[BenchmarkResult]:
     """Run benchmark for all queries against all models.
 
@@ -1421,12 +1498,35 @@ def run_benchmark(
                      incrementally in deterministic task order.
     """
 
-    results: List[Optional[BenchmarkResult]] = []
-
     # Create tasks: (query, model_config) pairs
     # Group by model to minimize model reloading (important for Ollama/local inference)
-    tasks = [(q, m) for m in model_configs for q in queries]
+    all_tasks = []
+    for model_config in model_configs:
+        for query in queries:
+            key = _build_resume_key(
+                query=query.query,
+                model_name=model_config.name,
+                task_name=query.task_name,
+                metric=query.metric,
+                ground_truth=query.ground_truth,
+                choices=query.choices,
+                category=query.category,
+            )
+            all_tasks.append((query, model_config, key))
+
+    completed_resume_keys: Set[str] = set()
+    if resume:
+        completed_resume_keys = _load_completed_resume_keys(output_path)
+
+    tasks = [
+        (q, m, k)
+        for q, m, k in all_tasks
+        if not resume or k not in completed_resume_keys
+    ]
+
+    already_completed = len(all_tasks) - len(tasks)
     total_tasks = len(tasks)
+    results: List[Optional[BenchmarkResult]] = []
     results = [None] * total_tasks
 
     # Group models by endpoint for display
@@ -1436,6 +1536,10 @@ def run_benchmark(
     print(
         f"\nBenchmarking {len(queries)} queries × {len(model_configs)} models = {total_tasks} requests"
     )
+    if resume:
+        print(
+            f"Resume mode: {already_completed} requests already completed, {total_tasks} pending"
+        )
     print(f"Models: {', '.join(model_names)}")
     if len(endpoints) == 1:
         print(f"Endpoint: {list(endpoints)[0]}")
@@ -1461,13 +1565,18 @@ def run_benchmark(
     output_file = None
     if output_path is not None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_file = open(output_path, "w", encoding="utf-8")
+        file_mode = "a" if resume else "w"
+        output_file = open(output_path, file_mode, encoding="utf-8")
 
     try:
+        if total_tasks == 0:
+            print("No pending requests. Nothing to run.")
+            return []
+
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             futures: Dict[Any, Tuple[int, QueryRecord, ModelConfig]] = {}
 
-            for idx, (query, model_config) in enumerate(tasks):
+            for idx, (query, model_config, _task_key) in enumerate(tasks):
                 future = executor.submit(
                     benchmark_query,
                     model_config,
@@ -1569,11 +1678,40 @@ def run_evaluation_only(
     on_progress=None,
     eval_config: Optional[EvalConfig] = None,
     output_path: Optional[Path] = None,
+    resume: bool = False,
 ) -> List[BenchmarkResult]:
     """Evaluate already-generated responses without querying any model endpoint."""
 
-    total_tasks = len(records)
+    all_records_with_keys = []
+    for record in records:
+        key = _build_resume_key(
+            query=record.query_record.query,
+            model_name=record.model_name,
+            task_name=record.query_record.task_name,
+            metric=record.query_record.metric,
+            ground_truth=record.query_record.ground_truth,
+            choices=record.query_record.choices,
+            category=record.query_record.category,
+        )
+        all_records_with_keys.append((record, key))
+
+    completed_resume_keys: Set[str] = set()
+    if resume:
+        completed_resume_keys = _load_completed_resume_keys(output_path)
+
+    pending_records = [
+        record
+        for record, key in all_records_with_keys
+        if not resume or key not in completed_resume_keys
+    ]
+
+    already_completed = len(all_records_with_keys) - len(pending_records)
+    total_tasks = len(pending_records)
     print(f"\nEvaluate-only mode: scoring {total_tasks} existing responses")
+    if resume:
+        print(
+            f"Resume mode: {already_completed} responses already completed, {total_tasks} pending"
+        )
     print(f"Concurrency: {concurrency}")
     print("No model inference requests will be sent in this mode.")
     print()
@@ -1593,12 +1731,17 @@ def run_evaluation_only(
     output_file = None
     if output_path is not None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_file = open(output_path, "w", encoding="utf-8")
+        file_mode = "a" if resume else "w"
+        output_file = open(output_path, file_mode, encoding="utf-8")
 
     try:
+        if total_tasks == 0:
+            print("No pending responses. Nothing to evaluate.")
+            return []
+
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             futures: Dict[Any, int] = {}
-            for idx, record in enumerate(records):
+            for idx, record in enumerate(pending_records):
                 future = executor.submit(
                     _evaluate_existing_record,
                     record,
@@ -1725,6 +1868,7 @@ def run_benchmark_pipeline(
     show_progress: bool = True,
     on_progress=None,
     eval_config: Optional[EvalConfig] = None,
+    resume: bool = False,
 ) -> List[BenchmarkResult]:
     """
     Run the full benchmark pipeline: load queries -> load models -> benchmark -> save.
@@ -1801,6 +1945,7 @@ def run_benchmark_pipeline(
             on_progress=eval_progress if on_progress else None,
             eval_config=eval_config,
             output_path=Path(output_path),
+            resume=resume,
         )
 
         progress(92, "Finalizing output", f"Streamed {len(results)} results to {output_path}")
@@ -1878,6 +2023,7 @@ def run_benchmark_pipeline(
         on_progress=benchmark_progress if on_progress else None,
         eval_config=eval_config,
         output_path=Path(output_path),
+        resume=resume,
     )
 
     progress(92, "Finalizing output", f"Streamed {len(results)} results to {output_path}")
@@ -1989,6 +2135,11 @@ After benchmarking, train directly (category is preserved from input):
         type=str,
         default="benchmark_output.jsonl",
         help="Output file path (must be different from --queries; default: benchmark_output.jsonl)",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from existing --output by skipping already completed entries",
     )
     parser.add_argument(
         "--max-tokens",
@@ -2228,6 +2379,7 @@ After benchmarking, train directly (category is preserved from input):
             limit=args.limit or 0,
             show_progress=not args.no_progress,
             eval_config=eval_config,
+            resume=args.resume,
         )
     except (FileNotFoundError, ValueError) as e:
         print(f"Error: {e}")
