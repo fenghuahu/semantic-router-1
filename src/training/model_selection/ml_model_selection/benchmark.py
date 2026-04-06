@@ -587,7 +587,35 @@ def _build_resume_key(
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
-def _load_completed_resume_keys(output_path: Optional[Path]) -> Set[str]:
+def _classify_retryable_resume_row(
+    row: Dict[str, Any],
+    retry_on_incomplete_response: bool = False,
+) -> Optional[str]:
+    """Return the retry reason for a resume row, or None if it is complete."""
+
+    if row.get("judge_reason") == JUDGE_TIMEOUT_PLACEHOLDER_REASON:
+        return "timeout_placeholder"
+
+    if not retry_on_incomplete_response:
+        return None
+
+    response = row.get("response")
+    if response is None:
+        return "empty_response"
+
+    response_text = str(response).strip()
+    if not response_text:
+        return "empty_response"
+    if response_text.startswith("Error:"):
+        return "error_response"
+
+    return None
+
+
+def _load_completed_resume_keys(
+    output_path: Optional[Path],
+    retry_on_incomplete_response: bool = False,
+) -> Set[str]:
     """Load completed task keys from an existing JSONL output file."""
 
     if output_path is None or not output_path.exists():
@@ -596,6 +624,8 @@ def _load_completed_resume_keys(output_path: Optional[Path]) -> Set[str]:
     completed: Set[str] = set()
     invalid_lines = 0
     timeout_placeholders = 0
+    empty_responses = 0
+    error_responses = 0
 
     with open(output_path, "r", encoding="utf-8") as f:
         for line_num, line in enumerate(f, 1):
@@ -614,9 +644,18 @@ def _load_completed_resume_keys(output_path: Optional[Path]) -> Set[str]:
             if query is None or model_name is None:
                 continue
 
-            # Timeout placeholder rows should be retried on resume.
-            if row.get("judge_reason") == JUDGE_TIMEOUT_PLACEHOLDER_REASON:
+            retry_reason = _classify_retryable_resume_row(
+                row,
+                retry_on_incomplete_response=retry_on_incomplete_response,
+            )
+            if retry_reason == "timeout_placeholder":
                 timeout_placeholders += 1
+                continue
+            if retry_reason == "empty_response":
+                empty_responses += 1
+                continue
+            if retry_reason == "error_response":
+                error_responses += 1
                 continue
 
             completed.add(
@@ -639,18 +678,31 @@ def _load_completed_resume_keys(output_path: Optional[Path]) -> Set[str]:
         print(
             f"Info: Found {timeout_placeholders} timeout placeholder rows in {output_path}; they will be re-evaluated."
         )
+    if empty_responses:
+        print(
+            f"Info: Found {empty_responses} empty-response rows in {output_path}; they will be re-fetched."
+        )
+    if error_responses:
+        print(
+            f"Info: Found {error_responses} Error:-response rows in {output_path}; they will be re-fetched."
+        )
 
     return completed
 
 
-def _compact_resume_output(output_path: Optional[Path]) -> None:
-    """Rewrite resume output file without timeout placeholders before appending."""
+def _compact_resume_output(
+    output_path: Optional[Path],
+    retry_on_incomplete_response: bool = False,
+) -> None:
+    """Rewrite resume output file without retryable rows before appending."""
 
     if output_path is None or not output_path.exists():
         return
 
     retained_lines: List[str] = []
     removed_timeouts = 0
+    removed_empty_responses = 0
+    removed_error_responses = 0
     invalid_lines = 0
 
     with open(output_path, "r", encoding="utf-8") as f:
@@ -665,26 +717,45 @@ def _compact_resume_output(output_path: Optional[Path]) -> None:
                 invalid_lines += 1
                 continue
 
-            if row.get("judge_reason") == JUDGE_TIMEOUT_PLACEHOLDER_REASON:
+            retry_reason = _classify_retryable_resume_row(
+                row,
+                retry_on_incomplete_response=retry_on_incomplete_response,
+            )
+            if retry_reason == "timeout_placeholder":
                 removed_timeouts += 1
+                continue
+            if retry_reason == "empty_response":
+                removed_empty_responses += 1
+                continue
+            if retry_reason == "error_response":
+                removed_error_responses += 1
                 continue
 
             retained_lines.append(json.dumps(row))
 
-    if removed_timeouts == 0 and invalid_lines == 0:
+    if (
+        removed_timeouts == 0
+        and removed_empty_responses == 0
+        and removed_error_responses == 0
+        and invalid_lines == 0
+    ):
         return
 
     with open(output_path, "w", encoding="utf-8") as f:
         for line in retained_lines:
             f.write(line + "\n")
 
+    removed_parts = [f"removed {removed_timeouts} timeout placeholders"]
+    if removed_empty_responses:
+        removed_parts.append(f"{removed_empty_responses} empty-response rows")
+    if removed_error_responses:
+        removed_parts.append(f"{removed_error_responses} Error:-response rows")
+    if invalid_lines:
+        removed_parts.append(f"{invalid_lines} invalid JSON lines")
+
     print(
-        f"Info: Compacted resume output {output_path}; removed {removed_timeouts} timeout placeholders"
-        + (
-            f" and {invalid_lines} invalid JSON lines"
-            if invalid_lines
-            else ""
-        )
+        f"Info: Compacted resume output {output_path}; "
+        + ", ".join(removed_parts)
         + "."
     )
 
@@ -1328,7 +1399,9 @@ def _fuse_scores(
         return min(rule_score, judge_score), "min"
 
     # weighted
-    final_score = eval_config.alpha * rule_score + (1.0 - eval_config.alpha) * judge_score
+    final_score = (
+        eval_config.alpha * rule_score + (1.0 - eval_config.alpha) * judge_score
+    )
     return final_score, "weighted"
 
 
@@ -1366,7 +1439,9 @@ def _evaluate_with_judge(
                 },
             }
 
-            judge_context = judge_semaphore if judge_semaphore is not None else nullcontext()
+            judge_context = (
+                judge_semaphore if judge_semaphore is not None else nullcontext()
+            )
             with judge_context:
                 judge_resp = eval_client.chat.completions.create(**request_kwargs)
 
@@ -1656,8 +1731,14 @@ def run_benchmark(
 
     completed_resume_keys: Set[str] = set()
     if resume:
-        completed_resume_keys = _load_completed_resume_keys(output_path)
-        _compact_resume_output(output_path)
+        completed_resume_keys = _load_completed_resume_keys(
+            output_path,
+            retry_on_incomplete_response=True,
+        )
+        _compact_resume_output(
+            output_path,
+            retry_on_incomplete_response=True,
+        )
 
     tasks = [
         (q, m, k)
@@ -1698,7 +1779,6 @@ def run_benchmark(
     written = 0
     next_to_write = 0
     finished: List[bool] = [False] * total_tasks
-    task_deadlines: List[Optional[float]] = [None] * total_tasks
     task_contexts: List[Tuple[QueryRecord, str]] = [
         (query, model_config.name) for query, model_config, _ in tasks
     ]
@@ -1708,11 +1788,6 @@ def run_benchmark(
         judge_semaphore = threading.Semaphore(max(1, eval_config.concurrency))
         eval_client = eval_config.get_client()
     evaluation_mode = eval_config.mode if eval_config is not None else "rule_only"
-    ordered_write_timeout_seconds = (
-        eval_config.timeout_seconds
-        if eval_config is not None
-        else DEFAULT_EVAL_TIMEOUT_SECONDS
-    )
 
     output_file = None
     if output_path is not None:
@@ -1770,10 +1845,8 @@ def run_benchmark(
                         pbar.update(1)
 
             if output_file is not None:
-                now = time.time()
                 while next_to_write < total_tasks:
                     if finished[next_to_write]:
-                        task_deadlines[next_to_write] = None
                         pending_result = results[next_to_write]
                         if pending_result is None:
                             query_rec, model_name = task_contexts[next_to_write]
@@ -1785,40 +1858,6 @@ def run_benchmark(
                             results[next_to_write] = pending_result
                         output_file.write(
                             json.dumps(pending_result.to_jsonl_dict()) + "\n"
-                        )
-                        output_file.flush()
-                        written += 1
-                        next_to_write += 1
-                        continue
-
-                    if task_deadlines[next_to_write] is None:
-                        task_deadlines[next_to_write] = (
-                            now
-                            + ordered_write_timeout_seconds
-                            + ORDERED_WRITE_STALL_GRACE_SECONDS
-                        )
-                        break
-
-                    if now >= task_deadlines[next_to_write]:
-                        query_rec, model_name = task_contexts[next_to_write]
-                        timeout_result = _build_timeout_placeholder_for_benchmark(
-                            query_rec,
-                            model_name,
-                            evaluation_mode,
-                        )
-                        results[next_to_write] = timeout_result
-                        finished[next_to_write] = True
-                        timed_out += 1
-
-                        timeout_future = future_by_idx.get(next_to_write)
-                        if timeout_future is not None:
-                            pending_futures.discard(timeout_future)
-
-                        if pbar is not None:
-                            pbar.update(1)
-
-                        output_file.write(
-                            json.dumps(timeout_result.to_jsonl_dict()) + "\n"
                         )
                         output_file.flush()
                         written += 1
@@ -2010,9 +2049,11 @@ def run_evaluation_only(
                         task_deadlines[next_to_write] = None
                         pending_result = results[next_to_write]
                         if pending_result is None:
-                            pending_result = _build_timeout_placeholder_for_existing_record(
-                                pending_records[next_to_write],
-                                evaluation_mode,
+                            pending_result = (
+                                _build_timeout_placeholder_for_existing_record(
+                                    pending_records[next_to_write],
+                                    evaluation_mode,
+                                )
                             )
                             results[next_to_write] = pending_result
                         output_file.write(
@@ -2238,7 +2279,9 @@ def run_benchmark_pipeline(
             resume=resume,
         )
 
-        progress(92, "Finalizing output", f"Streamed {len(results)} results to {output_path}")
+        progress(
+            92, "Finalizing output", f"Streamed {len(results)} results to {output_path}"
+        )
         progress(96, "Summary", "Generating summary")
         print_summary(results)
         return results
@@ -2277,8 +2320,7 @@ def run_benchmark_pipeline(
             temperature=temperature,
             enable_thinking=enable_thinking,
             enable_thinking_format=(
-                normalized_enable_thinking_format
-                or ENABLE_THINKING_FORMAT_DIRECT
+                normalized_enable_thinking_format or ENABLE_THINKING_FORMAT_DIRECT
             ),
         )
     else:
@@ -2316,7 +2358,9 @@ def run_benchmark_pipeline(
         resume=resume,
     )
 
-    progress(92, "Finalizing output", f"Streamed {len(results)} results to {output_path}")
+    progress(
+        92, "Finalizing output", f"Streamed {len(results)} results to {output_path}"
+    )
 
     progress(96, "Summary", "Generating summary")
 
@@ -2582,9 +2626,7 @@ After benchmarking, train directly (category is preserved from input):
     queries_abs = Path(args.queries).expanduser().resolve()
     output_abs = Path(args.output).expanduser().resolve()
     if queries_abs == output_abs:
-        print(
-            "Error: --output must be a new file and cannot be the same as --queries"
-        )
+        print("Error: --output must be a new file and cannot be the same as --queries")
         sys.exit(1)
 
     evaluate_only_input = False
@@ -2647,7 +2689,9 @@ After benchmarking, train directly (category is preserved from input):
             rubric_version=args.eval_rubric_version,
         )
     elif args.eval_model:
-        print("Warning: --eval-model provided but --eval-mode=rule_only; judge settings are ignored")
+        print(
+            "Warning: --eval-model provided but --eval-mode=rule_only; judge settings are ignored"
+        )
 
     try:
         results = run_benchmark_pipeline(
