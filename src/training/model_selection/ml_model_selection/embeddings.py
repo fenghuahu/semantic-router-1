@@ -129,24 +129,43 @@ def generate_embeddings_for_queries(
     Returns:
         Dict mapping query -> embedding
     """
-    # Check cache first
+    # Ensure query list has stable ordering with no duplicates.
+    deduped_queries = list(dict.fromkeys(queries))
+
+    cached_embeddings: Dict[str, np.ndarray] = {}
+
+    # Check cache first, but only reuse entries for the requested queries.
     if cache_file and os.path.exists(cache_file):
         print(f"Loading cached embeddings from {cache_file}")
-        data = np.load(cache_file, allow_pickle=True)
-        return dict(data["embeddings"].item())
+        try:
+            data = np.load(cache_file, allow_pickle=True)
+            cached_obj = data["embeddings"].item()
+            if isinstance(cached_obj, dict):
+                cached_embeddings = dict(cached_obj)
+            else:
+                print("Warning: Invalid embedding cache format, regenerating cache")
+        except Exception as e:
+            print(f"Warning: Failed to load embedding cache ({e}), regenerating cache")
 
-    # Generate embeddings
-    generator = EmbeddingGenerator(model_name, cache_dir)
-    embeddings = generator.encode(queries, batch_size=batch_size)
+    missing_queries = [q for q in deduped_queries if q not in cached_embeddings]
 
-    # Create mapping
-    result = {q: emb for q, emb in zip(queries, embeddings)}
+    if missing_queries:
+        print(
+            f"Generating embeddings for {len(missing_queries)} missing "
+            f"queries (cache hits: {len(deduped_queries) - len(missing_queries)})"
+        )
+        generator = EmbeddingGenerator(model_name, cache_dir)
+        missing_vectors = generator.encode(missing_queries, batch_size=batch_size)
+        for q, emb in zip(missing_queries, missing_vectors):
+            cached_embeddings[q] = emb
 
-    # Save cache
-    if cache_file:
-        cache_path = Path(cache_file)
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez(cache_file, embeddings=result)
-        print(f"Saved embeddings cache to {cache_file}")
+        # Persist merged cache for future runs.
+        if cache_file:
+            cache_path = Path(cache_file)
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez(cache_file, embeddings=cached_embeddings)
+            print(f"Updated embeddings cache at {cache_file}")
+    else:
+        print(f"All {len(deduped_queries)} query embeddings loaded from cache")
 
-    return result
+    return {q: cached_embeddings[q] for q in deduped_queries if q in cached_embeddings}

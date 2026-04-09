@@ -63,9 +63,11 @@ def create_training_samples(
         List of TrainingSample objects
     """
     samples = []
+    missing_embedding_count = 0
 
     for record in records:
         if record.query not in embeddings:
+            missing_embedding_count += 1
             continue
 
         # Create feature vector (embedding + category one-hot)
@@ -79,6 +81,16 @@ def create_training_samples(
                 quality=record.quality,
                 latency_ms=record.latency_ms,
             )
+        )
+
+    if records and not samples:
+        print(
+            "Warning: 0 training samples created because no record queries "
+            "matched generated embeddings"
+        )
+        print(
+            f"  records={len(records)}, embeddings={len(embeddings)}, "
+            f"missing_embeddings={missing_embedding_count}"
         )
 
     return samples
